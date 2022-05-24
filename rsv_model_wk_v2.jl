@@ -1,4 +1,7 @@
-
+cd("./RSV_resurgence/")
+using Pkg
+Pkg.activate(".")
+##
 
 using OrdinaryDiffEq, StatsPlots, Statistics, CSV, FileIO, DataFrames, Dates, LinearAlgebra, DiffEqFlux, Tullio
 using DataInterpolations, DiffEqSensitivity, ForwardDiff, Zygote, JLD2, Plots.PlotMeasures, RCall
@@ -340,6 +343,26 @@ end
 
 logit_wk₀ =  rand(Float32, n_wk)
 ##
+
+β_school_logit, β_LD_logit, p_R_logit, obs_scale_log, risk_rhino_log, risk_flu_log = fit.u[1:6]
+logit_wk = fit.u[(6+1):(6+n_wk)]
+# prec_logdiff_wk = exp(log_prec_logdiff_wk)
+# prec_hosprate = exp(log_prec_hosprate)
+prec_logdiff_wk = 1/0.1^2
+prec_hosprate= 1 / 0.25
+# p_v = θ[(6+n_wk+1):(6+n_wk+n_v)]
+β_school = 3.0 * sigmoid(β_school_logit)
+β_LD = sigmoid(β_LD_logit)
+p_R = sigmoid(p_R_logit)
+wks = 3.0 * sigmoid.(logit_wk)
+obs_scale = [exp(obs_scale_log + risk_rhino_log * rhino_perc(t) + risk_flu_log * influ_perc(t)) for t in ts]
+
+_p = [[β_school, β_LD, γ₁, γ₂, σ, ι, B, N, μ, ϵ]; wks]
+_u0 = u0 .* (1 - p_R) .+ p_R .* change_mat
+
+
+##
+
 # [[β_school, β_LD, α, γ, σ, ι, B, N, μ, ϵ]; logit_wk₀; p_init_viruses]
 # @time l, pred = loss_func_wk([[0.0f0, 0.0f0, -1.0f0, 0.0f0, 0.0f0, 0.0f0]; logit_wk₀; p_init_viruses], prob_RSV_wk, rsv_hosp_rate, ForwardDiffSensitivity())
 θ₀ = [[-0.0,0.0,-1.0, 0.0f0, 0.0f0, 0.0f0]; logit_wk₀] .|> Float64
@@ -387,7 +410,7 @@ fit3 = DiffEqFlux.sciml_train(θ -> loss_func_wk(θ, prob_RSV_wk, rsv_hosp_rate,
 #     callback=plot_hosps)
 
 ##
-exp.(fit.u[(end-2):end])
+exp.(fit.u[4:6])
 β_wk_fit =  3.0* sigmoid.(fit.u[(6+1):(6+n_wk)])
 β_school_fit = 3.0 * sigmoid(fit.u[1])
 β_LD_fit = sigmoid(fit.u[2])
