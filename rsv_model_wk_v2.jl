@@ -1,7 +1,4 @@
-cd("./RSV_resurgence/")
-using Pkg
-Pkg.activate(".")
-##
+
 
 using OrdinaryDiffEq, StatsPlots, Statistics, CSV, FileIO, DataFrames, Dates, LinearAlgebra, DiffEqFlux, Tullio
 using DataInterpolations, DiffEqSensitivity, ForwardDiff, Zygote, JLD2, Plots.PlotMeasures, RCall
