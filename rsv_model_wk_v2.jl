@@ -281,7 +281,7 @@ function log_lklhood(θ, prob, hosp_data, sensealg)
 end
 
 function log_prior(θ)
-
+    
 
 end
 
