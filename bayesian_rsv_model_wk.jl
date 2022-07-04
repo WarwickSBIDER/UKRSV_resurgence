@@ -1,6 +1,9 @@
 using OrdinaryDiffEq, StatsPlots, Statistics, CSV, DataFrames, Dates, LinearAlgebra, Tullio
 using DataInterpolations, DiffEqSensitivity, Zygote, JLD2, Plots.PlotMeasures, DiffEqCallbacks
 using Distributions,MCMCChains
+using Flux: sigmoid
+using Turing
+using Turing: Variational
 
 ## Load contact matrices, population distribution and RSV hosp data time series
 
@@ -207,93 +210,99 @@ function log_prior(θ)
     β_school_logit, β_LD_logit, p_R_logit, obs_scale_log, risk_rhino_log, risk_flu_log = θ[1:6]
     logit_wk = θ[(6+1):end]
     wks = 3.0 * sigmoid.(logit_wk)
+    #Define the precision of the relatively weekly change in transmission and hospitalisation observations
+    prec_logdiff_wk = 1/0.1^2
+    prec_hosprate= 1 / 0.25
     #loss due to deviation from priors
     reg = -sum(abs2, diff(log.(wks))) * prec_logdiff_wk * 0.5 #Log-Normal prior distributed change in transmission rates across weeks
     reg -= 0.5 * sum(abs2, [obs_scale_log, risk_rhino_log, risk_flu_log]) #log-normal prior distributed risk factors
     return reg
 end
 
-θ_fit = [fit.u[1:6];100.0;4.0;fit.u[7:end]] 
+θ_fit = copy(fit.u)
 
-posterior_density(θ) = log_lklhood(θ, prob_RSV_wk, rsv_hosp_rate, InterpolatingAdjoint(autojacvec=ReverseDiffVJP(false))) + log_prior(θ)
+log_posterior_density(θ) = log_lklhood(θ, prob_RSV_wk, rsv_hosp_rate, InterpolatingAdjoint(autojacvec=ReverseDiffVJP(false))) + log_prior(θ)
 
-posterior_density(θ_fit)
-val,g = Zygote.withgradient(posterior_density,θ_fit)
+log_posterior_density(θ_fit)
+val,g = Zygote.withgradient(log_posterior_density,θ_fit)
 
 n_params = length(θ_fit)
-function psgld!(posterior_density,θ,V,G,λ,α,dt)
-    g = Zygote.gradient(posterior_density,θ)[1]
-    V .= α.*V .+ (1 - α) .* g .*g
-    G .= 1 ./ ( λ .+ sqrt.(V))
-    θ .+= (0.5 * dt * G .* g) .+ (sqrt(dt) * sqrt.(G) .* randn(n_params))
-end
+# function psgld!(posterior_density,θ,V,G,λ,α,dt)
+#     g = Zygote.gradient(posterior_density,θ)[1]
+#     V .= α.*V .+ (1 - α) .* g .*g
+#     G .= 1 ./ ( λ .+ sqrt.(V))
+#     θ .+= (0.5 * dt * G .* g) .+ (sqrt(dt) * sqrt.(G) .* randn(n_params))
+# end
 
-function mala(posterior_density,θ,V,G,λ,α,dt)
+function mala(lpd::Function,θ,V,G,λ,α,dt)
     acceptance = false
-    log_pd,∇ = Zygote.withgradient(posterior_density,θ)#log post. density and grad
+    log_pd,∇ = Zygote.withgradient(lpd,θ)#log post. density and grad
     g = ∇[1]
     V .= α.*V .+ (1 - α) .* g .*g #Update local estimate of the element squared gradient
     G .= 1 ./ ( λ .+ sqrt.(V)) #Update local estimate for prec-conditioning matrix
     θ_prop = θ .+ (0.5 * dt * G .* g) .+ (sqrt(dt) * sqrt.(G) .* randn(n_params)) # Proposed next parameters
-    log_pd_prop,∇_prop = Zygote.withgradient(posterior_density,θ_prop) # log post density and grad at proposal 
+    log_pd_prop,∇_prop = Zygote.withgradient(lpd,θ_prop) # log post density and grad at proposal 
     g_prop = ∇_prop[1]
     #Calculate the acceptance probability
     log_prob_step = log_pd_prop - log_pd  
-    log_prob_step += 0.5 * (1/dt) * (-sum((λ .+ sqrt.(V)) .* (θ .- 0.5 * dt * G .* g_prop).^2 ) + sum((λ .+ sqrt.(V)) .* (θ_prop .- 0.5 * dt * G .* g).^2 ) )
+    log_prob_step += 0.5 * (1/dt) * (-sum((λ .+ sqrt.(V)) .* (θ .- (θ_prop .+ 0.5 * dt * G .* g_prop)).^2 ) + sum((λ .+ sqrt.(V)) .* (θ_prop .- (θ .+ 0.5 * dt * G .* g)).^2 ) )
     if log_prob_step >= 0.0 || log(rand()) < log_prob_step
         θ .= θ_prop
         acceptance = true
+        log_pd = log_pd_prop
     end
 
-    return acceptance,min(exp(log_prob_step),1.0)
+    return acceptance,min(exp(log_prob_step),1.0),log_pd
 
 end
-@time acc,acc_prob = mala(posterior_density,θ₀ .+ 0.01*randn(n_params) ,zeros(n_params),zeros(n_params),1e-3,0.99,0.01)
-@time psgld!(posterior_density,θ₀,zeros(n_params),zeros(n_params),1e-3,0.99,0.01)
-draws = zeros(n_params,1000)
+# @time acc,acc_prob = mala(log_posterior_density,θ_fit .+ 0.00001*randn(n_params) ,zeros(n_params),zeros(n_params),1e-5,0.99,0.01)
+# @time psgld!(posterior_density,θ₀,zeros(n_params),zeros(n_params),1e-3,0.99,0.01)
 
-function run_psgld(posterior_density,θ₀,n_samples;λ = 1e-3,α = 0.99,dt = 0.01,sample_times = 0.1)
+
+# function run_psgld(posterior_density,θ₀,n_samples;λ = 1e-3,α = 0.99,dt = 0.01,sample_times = 0.1)
+#     G = zeros(n_params)
+#     draws = zeros(n_params,n_samples)
+#     θ = copy(θ₀)
+#     println("Initial post. density $(posterior_density(θ))")
+#     # g₀ = Zygote.gradient(posterior_density,θ₀)[1]
+#     V = zeros(n_params)
+
+#     for j = 1:n_samples
+#         T = 0.0
+#         while T <= sample_times
+#             psgld!(posterior_density,θ,V,G,λ,α,dt)
+#             T += dt
+#         end
+#         draws[:,j] .= θ
+#         println("Sample $(j), post. density $(posterior_density(θ))")
+#     end
+#     return draws
+# end
+
+
+function run_mala(lpd::Function,θ₀,n_samples;λ = 1e-3,α = 0.99,dt = 0.01,sample_times = 0.1)
     G = zeros(n_params)
     draws = zeros(n_params,n_samples)
     θ = copy(θ₀)
-    println("Initial post. density $(posterior_density(θ))")
-    # g₀ = Zygote.gradient(posterior_density,θ₀)[1]
-    V = zeros(n_params)
-
-    for j = 1:n_samples
-        T = 0.0
-        while T <= sample_times
-            psgld!(posterior_density,θ,V,G,λ,α,dt)
-            T += dt
-        end
-        draws[:,j] .= θ
-        println("Sample $(j), post. density $(posterior_density(θ))")
-    end
-    return draws
-end
-
-
-function run_mala(posterior_density,θ₀,n_samples;λ = 1e-3,α = 0.99,dt = 0.01,sample_times = 0.1)
-    G = zeros(n_params)
-    draws = zeros(n_params,n_samples)
-    θ = copy(θ₀)
-    println("Initial log. post. density $(posterior_density(θ))")
+    log_pd_init = lpd(θ)
+    println("Initial log. post. density $(log_pd_init)")
     # g₀ = Zygote.gradient(posterior_density,θ₀)[1]
     V = zeros(n_params)
     recent_acp_prob = 0.574
     for j = 1:n_samples
         T = 0.0
         while T <= sample_times
-            acc,acc_prob =  mala(posterior_density,θ,V,G,λ,α,dt)
+            acc,acc_prob,log_pd =  mala(lpd,θ,V,G,λ,α,dt)
             recent_acp_prob = 0.95*recent_acp_prob + 0.05*acc_prob
+            log_pd_init = log_pd
             # dt *= 1 + 0.1*(recent_acp_prob - 0.574)
-            # println("time = $(T), acc prob = $(recent_acp_prob), dt = $(dt)")
+            # println("time = $(T), acc prob = $(recent_acp_prob), log. post. den = $(log_pd)")
             if acc
                 T += dt
             end
         end
         draws[:,j] .= θ
-        println("Sample $(j), log. post. density $(posterior_density(θ)), acc prob = $(recent_acp_prob), dt = $(dt)")
+        println("Sample $(j), log. post. density $(log_pd_init), acc prob = $(recent_acp_prob)")
     end
     return draws
 end
@@ -301,8 +310,21 @@ end
 
 θ₀ = copy(θ_fit)
 
-draws = run_psgld(posterior_density,θ₀,1000;dt = 1e-4,λ=1e-3,sample_times = 1e-3)
-draws = run_mala(posterior_density,θ₀,1000;dt = 1e-5,λ=1e-3,sample_times = 1e-4)
+# draws = run_psgld(posterior_density,θ₀,1000;dt = 1e-4,λ=1e-3,sample_times = 1e-3)
+draws = run_mala(log_posterior_density,θ₀.*exp.(0.00.*randn(n_params)),1000;dt = 1e-5,λ=1e-3,sample_times = 1e-4)
+
+# setadbackend(:zygote)
+# advi = ADVI(10, 1000)
+
+# @model function lpd(prob, hosp_data, sensealg)
+#     β_school_logit ~ Normal(0,4)
+
+#     , β_LD_logit, p_R_logit, obs_scale_log, risk_rhino_log, risk_flu_log
+# end
+
+# q = vi(log_posterior_density, advi)
+
+
 
 # #After inital estimate run a Bayesian inference using EM algorithm to regress onto marginal mode
 # #estimate for the weekly infection rates
